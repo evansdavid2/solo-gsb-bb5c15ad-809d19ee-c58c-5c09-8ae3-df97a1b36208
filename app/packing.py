@@ -48,15 +48,27 @@ returns every container, with a negative ``remaining_capacity`` for
 the overloaded ones.  Rounding to six places happens only when the
 response is rendered.
 
-Capacity magnitudes are unbounded (``max_weight`` may be something
-like ``1E+60``), so the capacity-minus-total subtraction runs in its
-own context widened to exactly the digit count the two operands span:
-one significant digit per integer digit of the larger operand plus
-every fractional digit of the more precise one.  That keeps every
-digit of the load instead of rounding it away at the audit's fixed
-50 significant figures; the item-weight arithmetic itself stays on
-that fixed context, and six-place rounding happens only when the
-response is rendered.
+Capacity magnitudes are bounded: ``max_weight`` must be a finite
+Decimal with at most ``MAX_WEIGHT_INTEGER_DIGITS`` integer digits and
+at most ``MAX_WEIGHT_FRACTIONAL_DIGITS`` fractional digits.  That
+window is far wider than any physical load (``1E+60``-scale capacities
+keep working) yet keeps the capacity-minus-total subtraction and the
+six-place JSON rendering cheap; a capacity outside the window rejects
+the whole request with :class:`PackingStructureError`
+(``MAX_WEIGHT_OUT_OF_RANGE``) naming the container index.
+
+Within the window the capacity-minus-total subtraction runs in its own
+context widened to exactly the digit count the two operands span: one
+significant digit per integer digit of the larger operand plus every
+fractional digit of the more precise one.  That keeps every digit of
+the load instead of rounding it away at the audit's fixed 50
+significant figures, and the validated bounds cap the working
+precision at ``MAX_DIFFERENCE_PRECISION`` so a single request cannot
+inflate the Decimal context into gigabyte-sized arithmetic.  The
+``over_limit`` flag itself is decided by an exact, context-free
+comparison of the unrounded operands -- kept separate from the
+six-place half-even rendering of the difference, which is the only
+consumer of the subtraction result.
 """
 
 from __future__ import annotations
@@ -71,6 +83,29 @@ REQUIRED_AI_TEXT = (
     "and exactly one weight AI 310n/320n"
 )
 
+# Bounds for a container's max_weight, chosen so the exact
+# capacity-minus-total subtraction and the six-place JSON rendering of
+# every response weight stay cheap: up to 10_000 integer digits
+# (capacities below 1E+10000) and up to 10_000 fractional digits.  A
+# 1E+60-scale capacity keeps working; inputs such as "1e999999999999999999"
+# that would force the Decimal context -- and the rendered JSON number --
+# towards 10**18 digits are rejected with 422 instead.
+MAX_WEIGHT_INTEGER_DIGITS = 10_000
+MAX_WEIGHT_FRACTIONAL_DIGITS = 10_000
+
+# Ceiling for the working precision of the capacity-minus-total
+# subtraction: the validated capacity window plus the digits an item
+# total can span (six source digits carried at ARITHMETIC_PRECISION
+# through the unit conversion) plus a guard digit.  Validated requests
+# never reach the ceiling; it is defence in depth for callers that
+# skip the validation.
+MAX_DIFFERENCE_PRECISION = (
+    MAX_WEIGHT_INTEGER_DIGITS
+    + MAX_WEIGHT_FRACTIONAL_DIGITS
+    + ARITHMETIC_PRECISION
+    + 2
+)
+
 
 def _exact_difference(capacity: Decimal, total: Decimal) -> Decimal:
     """Return ``capacity - total`` without any precision rounding.
@@ -81,8 +116,17 @@ def _exact_difference(capacity: Decimal, total: Decimal) -> Decimal:
     dictate the context width: one significant digit per integer digit of
     the larger operand (``adjusted() + 1``; zero needs none) plus one per
     fractional digit of the more precise one.  With that width the
-    subtraction -- and therefore the ``over_limit`` sign test -- keeps
-    every digit of both operands regardless of their magnitudes.
+    subtraction keeps every digit of both operands regardless of their
+    magnitudes.
+
+    The width is bounded: ``max_weight`` is validated against
+    ``MAX_WEIGHT_INTEGER_DIGITS`` / ``MAX_WEIGHT_FRACTIONAL_DIGITS``
+    before the audit rolls anything up, and an item total spans far
+    fewer digits than that, so the working precision never exceeds
+    ``MAX_DIFFERENCE_PRECISION``.  The result feeds only the six-place
+    half-even rendering of ``remaining_capacity``; the ``over_limit``
+    flag is an exact comparison of the unrounded operands and does not
+    depend on this context.
     """
     if capacity.is_zero():
         return -total
@@ -93,8 +137,9 @@ def _exact_difference(capacity: Decimal, total: Decimal) -> Decimal:
         integer_digits = 1
     fractional_digits = max(-capacity.as_tuple().exponent, -total.as_tuple().exponent, 0)
     with localcontext() as ctx:
-        ctx.prec = max(
-            ARITHMETIC_PRECISION, integer_digits + fractional_digits
+        ctx.prec = min(
+            MAX_DIFFERENCE_PRECISION,
+            max(ARITHMETIC_PRECISION, integer_digits + fractional_digits),
         )
         return capacity - total
 
@@ -275,6 +320,48 @@ def _unknown_parent(index: int, parent_id: str) -> None:
     )
 
 
+def _validate_max_weight(index: int, max_weight: Decimal) -> None:
+    """Reject a capacity outside the computable/renderable window.
+
+    ``max_weight`` must be a finite Decimal with at most
+    ``MAX_WEIGHT_INTEGER_DIGITS`` integer digits and at most
+    ``MAX_WEIGHT_FRACTIONAL_DIGITS`` fractional digits; anything wider
+    would let one request inflate the difference context and the
+    rendered JSON numbers towards 10**18 digits.
+    """
+    if max_weight.is_finite():
+        integer_digits = max_weight.adjusted() + 1
+        fractional_digits = -max_weight.as_tuple().exponent
+        if (
+            integer_digits <= MAX_WEIGHT_INTEGER_DIGITS
+            and fractional_digits <= MAX_WEIGHT_FRACTIONAL_DIGITS
+        ):
+            return
+        found = f"{max_weight:.6E}"
+    else:  # pragma: no cover - the request model rejects non-finite input
+        found = str(max_weight)
+    raise PackingStructureError(
+        {
+            "container_index": index,
+            "error": {
+                "error": "MAX_WEIGHT_OUT_OF_RANGE",
+                "message": (
+                    f"container {index}: max_weight {found} is outside the "
+                    f"supported range of at most {MAX_WEIGHT_INTEGER_DIGITS} "
+                    f"integer digits and {MAX_WEIGHT_FRACTIONAL_DIGITS} "
+                    "fractional digits"
+                ),
+                "expected": (
+                    f"a finite max_weight with at most "
+                    f"{MAX_WEIGHT_INTEGER_DIGITS} integer digits and "
+                    f"{MAX_WEIGHT_FRACTIONAL_DIGITS} fractional digits"
+                ),
+                "found": found,
+            },
+        }
+    )
+
+
 def _check_cycle(parent_of: list[int | None]) -> None:
     """Reject the request when the parent-pointer graph contains a cycle.
 
@@ -334,6 +421,12 @@ def audit(
     """
     with localcontext() as ctx:
         ctx.prec = ARITHMETIC_PRECISION
+
+        # -- capacities must stay inside the computable window --
+        for index, (_container_id, _parent_id, max_weight, _items) in enumerate(
+            containers
+        ):
+            _validate_max_weight(index, max_weight)
 
         # -- unique container ids (parents refer to these) --
         index_of: dict[str, int] = {}
@@ -453,10 +546,11 @@ def audit(
             containers
         ):
             total_weight = total_weights[index]
-            # The difference is computed in an operand-sized context so a
-            # capacity such as 1E+60 keeps every digit of the loaded
-            # weight; over_limit is then the exact sign of that value
-            # rather than the sign of its six-place rendering.
+            # over_limit is the exact, context-free comparison of the
+            # unrounded operands; the difference below feeds only the
+            # six-place rendering of remaining_capacity, computed in an
+            # operand-sized (and now bounded) context so a capacity such
+            # as 1E+60 keeps every digit of the loaded weight.
             remaining_capacity = _exact_difference(max_weight, total_weight)
             results.append(
                 {
@@ -469,7 +563,7 @@ def audit(
                     "remaining_capacity": remaining_capacity,
                     "direct_item_count": len(items),
                     "recursive_item_count": recursive_counts[index],
-                    "over_limit": remaining_capacity < 0,
+                    "over_limit": total_weight > max_weight,
                 }
             )
 

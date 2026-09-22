@@ -854,7 +854,10 @@ curl -X POST http://localhost:8080/batch-genealogy \
 - 每个容器含：必填的 `container_id`（非空字符串，**全请求唯一**）、可选的 `parent_id`
   （省略或 `null` 表示根容器；给定时必须等于本请求中某个 `container_id`）、必填的
   `max_weight`（容量上限，以 `target_unit` 计，**非负 `Decimal`**，JSON number 或字符串
-  均可）和必填的 `items`（直属货品扫码数组，可为空）。
+  均可；须为有限值，**整数位至多 10000 位、小数位至多 10000 位**——`1E+60` 量级的容量
+  照常工作，超出窗口的取值会使差值计算的 Decimal 上下文与 JSON 输出位数失去控制，因此
+  整单返回 `422`，错误码 `MAX_WEIGHT_OUT_OF_RANGE`，`detail.container_index` 定位出错
+  容器）和必填的 `items`（直属货品扫码数组，可为空）。
 - 每条货品扫码必须包含**恰好一个 AI 01**、**恰好一个 AI 21**（序列号）和**恰好一个
   重量 AI**（310n 或 320n，允许混合千克/磅）；AI 10（批号）与 AI 17（效期）可有可无、
   至多一个，不参与审计。任一条扫码解析失败或缺少/重复必需 AI，整个请求返回 `422`，
@@ -943,6 +946,23 @@ curl -X POST http://localhost:8080/packing-audit \
       "message": "containers 0 -> 1 -> 0 form a parent/child cycle; the container relationships must form a forest",
       "expected": "an acyclic container forest",
       "found": "cycle 0 -> 1 -> 0"
+    }
+  }
+}
+```
+
+`max_weight` 超出位数/指数窗口（非有限值、整数位超过 10000 位或小数位超过 10000 位，
+如 `"1e999999999999999999"`）时整单返回 `422`，`container_index` 定位出错容器：
+
+```json
+{
+  "detail": {
+    "container_index": 0,
+    "error": {
+      "error": "MAX_WEIGHT_OUT_OF_RANGE",
+      "message": "container 0: max_weight 1.000000E+999999999999999999 is outside the supported range of at most 10000 integer digits and 10000 fractional digits",
+      "expected": "a finite max_weight with at most 10000 integer digits and 10000 fractional digits",
+      "found": "1.000000E+999999999999999999"
     }
   }
 }
@@ -1209,7 +1229,7 @@ app/
   recall.py   # 召回范围盘点：GTIN+序列号实物去重与冲突检测、有序规则（GTIN+批号集合+效期闭区间）首命中归组、未命中汇总
   traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
   genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源/循环依赖图校验、稳定拓扑序库存扣减与超耗拒绝、批次最终余量
-  packing.py  # 装箱装载审计：容器森林校验（重复容器/未知父容器/环）、GTIN+序列号重复装载检测、叶到根直属与递归重量/货品数汇总、over_limit 超重标记
+  packing.py  # 装箱装载审计：容器森林校验（重复容器/未知父容器/环）、max_weight 位数/指数边界校验、GTIN+序列号重复装载检测、叶到根直属与递归重量/货品数汇总、over_limit 超重标记
   sampling.py # 批次重量双重抽样验收：GTIN+批号计划（闭区间 + n1/a1/r1/n2/a2/r2 阈值校验）、样本唯一 01/10/21/重量 AI 校验与 GTIN+序列号去重、阶段容量、匹配计划与定论后终止（STAGE_AFTER_DECISION）校验、一阶段定论终局不可改写的 accept/reject/pending 判定
 tests/
   test_parse.py

@@ -19,7 +19,13 @@ from .genealogy import (
     genealogy,
 )
 from .gs1 import GS1ParseError, parse
-from .packing import PackingAuditError, PackingStructureError, audit as packing_audit
+from .packing import (
+    MAX_WEIGHT_FRACTIONAL_DIGITS,
+    MAX_WEIGHT_INTEGER_DIGITS,
+    PackingAuditError,
+    PackingStructureError,
+    audit as packing_audit,
+)
 from .pickplan import DemandValidationError, pick_plan
 from .recall import ItemConflictError, RuleValidationError, assess
 from .sampling import (
@@ -105,7 +111,11 @@ app = FastAPI(
         "rolled up leaves-to-roots with exact Decimal arithmetic; a "
         "container over max_weight is flagged over_limit (with negative "
         "remaining_capacity) without rejecting the request, and the "
-        "response keeps the request order. POST /weight-sampling-audit "
+        "response keeps the request order. max_weight must be a finite "
+        "Decimal with at most 10000 integer and 10000 fractional "
+        "digits; a capacity outside that window rejects the whole "
+        "request with 422 (MAX_WEIGHT_OUT_OF_RANGE) naming the "
+        "container index. POST /weight-sampling-audit "
         "runs a double-sampling acceptance audit over drawn samples: each "
         "plan is keyed by GTIN + AI 10 batch and declares a closed weight "
         "interval [min_weight, max_weight] in the target unit plus "
@@ -695,7 +705,12 @@ class PackingContainer(BaseModel):
         description=(
             "Maximum load capacity in target_unit (a non-negative exact "
             "Decimal; JSON number or string accepted). A container whose "
-            "rolled-up total_weight exceeds it is flagged over_limit."
+            "rolled-up total_weight exceeds it is flagged over_limit. The "
+            f"capacity must be finite with at most "
+            f"{MAX_WEIGHT_INTEGER_DIGITS} integer digits and "
+            f"{MAX_WEIGHT_FRACTIONAL_DIGITS} fractional digits; a value "
+            "outside that window rejects the whole request with 422 "
+            "(MAX_WEIGHT_OUT_OF_RANGE) naming the container_index."
         ),
         examples=[10],
     )

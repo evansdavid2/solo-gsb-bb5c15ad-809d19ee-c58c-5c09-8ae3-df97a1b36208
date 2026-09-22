@@ -364,6 +364,116 @@ def test_six_place_rendering_hides_positive_remainder_without_flagging_over():
     assert '"remaining_capacity":0.000000' in resp.text
 
 
+# ----------------------------------------------------- max_weight digit bounds
+
+
+def test_max_weight_at_integer_digit_boundary_returns_full_audit():
+    # 10_000 integer digits is the widest supported capacity; the audit
+    # still returns the complete result with every digit rendered.
+    cap = "9" * 10000
+    resp = audit([container("WIDE", cap, [item("S1", "3103002000")])])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["total_weight"] == 2.0
+    assert entry["over_limit"] is False
+    assert f'"max_weight":{cap}.000000' in resp.text
+    assert f'"remaining_capacity":{"9" * 9999}7.000000' in resp.text
+
+
+def test_max_weight_beyond_integer_digit_bound_is_rejected():
+    # 1e10000 has 10_001 integer digits: one beyond the window.
+    resp = audit([container("HUGE", "1" + "0" * 10000)])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "MAX_WEIGHT_OUT_OF_RANGE"
+    assert detail["container_index"] == 0
+
+
+def test_max_weight_huge_exponent_is_rejected_without_hanging():
+    # A 22-character payload that would otherwise inflate the Decimal
+    # context towards 10**18 digits.
+    resp = audit([container("HUGE", "1e999999999999999999", [item("S1")])])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "MAX_WEIGHT_OUT_OF_RANGE"
+    assert detail["container_index"] == 0
+
+
+def test_max_weight_huge_negative_exponent_is_rejected_without_hanging():
+    resp = audit([container("DEEP", "1e-999999999999999999", [item("S1")])])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "MAX_WEIGHT_OUT_OF_RANGE"
+    assert detail["container_index"] == 0
+
+
+def test_max_weight_at_fractional_digit_boundary_returns_full_audit():
+    # 10_000 fractional digits: the load of 2 kg still exceeds the tiny
+    # capacity, and the exact comparison decides over_limit.
+    cap = "0." + "0" * 9999 + "1"
+    resp = audit([container("DEEP", cap, [item("S1", "3103002000")])])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["over_limit"] is True
+    assert '"max_weight":0.000000' in resp.text
+    assert '"remaining_capacity":-2.000000' in resp.text
+
+
+def test_max_weight_beyond_fractional_digit_bound_is_rejected():
+    resp = audit([container("DEEP", "1e-10001")])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "MAX_WEIGHT_OUT_OF_RANGE"
+    assert detail["container_index"] == 0
+
+
+def test_wide_capacity_with_deep_fractional_tail_stays_exact():
+    # 5_001 integer digits plus a 5_000-digit fractional tail: both
+    # bounds are respected and every digit of cap - 2 survives.
+    cap = "1" + "0" * 5000 + "." + "0" * 4999 + "5"
+    resp = audit([container("COMBO", cap, [item("S1", "3103002000")])])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["over_limit"] is False
+    token = resp.text.split('"remaining_capacity":')[1].split(",")[0]
+    assert token == "9" * 4999 + "8.000000"
+
+
+def test_out_of_range_capacity_locates_the_offending_container():
+    resp = audit(
+        [
+            container("OK1", 10, [item("S1", "3103002000")]),
+            container("OK2", 20, [item("S2", "3103001000")], parent_id="OK1"),
+            container("BAD", "1e10001"),
+        ]
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "MAX_WEIGHT_OUT_OF_RANGE"
+    assert detail["container_index"] == 2
+
+
+def test_non_finite_max_weight_is_rejected():
+    resp = audit([container("A", "Infinity")])
+    assert resp.status_code == 422
+
+
+def test_legal_boundary_request_still_returns_every_container():
+    resp = audit(
+        [
+            container("ROOT", "9" * 10000, []),
+            container("CHILD", 100, [item("C1", "3103002000")], parent_id="ROOT"),
+        ]
+    )
+    assert resp.status_code == 200
+    entries = by_id(resp.json())
+    assert entries["CHILD"]["total_weight"] == 2.0
+    assert entries["ROOT"]["total_weight"] == 2.0
+    assert entries["ROOT"]["recursive_item_count"] == 1
+    assert entries["ROOT"]["over_limit"] is False
+    assert f'"remaining_capacity":{"9" * 9999}7.000000' in resp.text
+
+
 # ------------------------------------------------------------ structural errors
 
 
