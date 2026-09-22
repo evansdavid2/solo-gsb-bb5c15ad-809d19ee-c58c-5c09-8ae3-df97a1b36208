@@ -48,15 +48,22 @@ returns every container, with a negative ``remaining_capacity`` for
 the overloaded ones.  Rounding to six places happens only when the
 response is rendered.
 
-Capacity magnitudes are unbounded (``max_weight`` may be something
-like ``1E+60``), so the capacity-minus-total subtraction runs in its
-own context widened to exactly the digit count the two operands span:
-one significant digit per integer digit of the larger operand plus
-every fractional digit of the more precise one.  That keeps every
-digit of the load instead of rounding it away at the audit's fixed
-50 significant figures; the item-weight arithmetic itself stays on
-that fixed context, and six-place rounding happens only when the
-response is rendered.
+Capacities may be large (``max_weight`` may be something like
+``1E+60``) but are not unbounded.  A capacity that sat at a huge
+integer magnitude *and* carried a deep fractional tail used to widen
+the subtraction context to ``integer_digits + fractional_digits`` -- a
+width taken straight from request text -- so a single crafted value
+forced a million-digit Decimal and starved the process of CPU and
+memory.  Capacities must therefore stay inside the fixed envelope
+:data:`MAX_CAPACITY_INTEGER_DIGITS` / :data:`MAX_CAPACITY_EXPONENT`
+(values the arithmetic, the six-place renderer and the JSON output all
+handle comfortably); an out-of-envelope value rejects the request with
+:class:`PackingStructureError` (``CAPACITY_OUT_OF_RANGE``) naming the
+container.  Inside the envelope the capacity-minus-total subtraction
+runs at the fixed :data:`DIFFERENCE_PRECISION`, the ``over_limit``
+sign is read from an exact Decimal comparison (never from the rounded
+remainder), and six-place half-even rounding still happens only when
+the response is rendered.
 """
 
 from __future__ import annotations
@@ -66,37 +73,89 @@ from decimal import Decimal, localcontext
 from .gs1 import GS1ParseError, Element, decode_weight, parse
 from .summary import ARITHMETIC_PRECISION, ScanValidationError, _to_target
 
+# Capacity envelope.  The integer-digit bound keeps the six-place
+# fixed-point JSON token bounded (1e60 plus .000000 is the documented
+# large-capacity case); the exponent bound keeps the fractional tail
+# bounded.  Together they make the largest representable capacity
+# 10**61 - 10**-50, a 111-coefficient-digit value.
+MAX_CAPACITY_INTEGER_DIGITS = 61
+MAX_CAPACITY_EXPONENT = -50
+
+# Working precision of the capacity-minus-total subtraction, large enough
+# to hold every digit the bounded operands and the item-weight arithmetic
+# can produce: 61 capacity integer digits plus the deepest total the
+# conversions can reach (the smallest single-item weight 1e-9 converts to
+# 2.2046...e-9 lb, exponent -36, under the 50-significant-digit reciprocal
+# context), with margin for the six-place render and the rounding carry.
+# The measured exact worst case spans 97 digits.
+DIFFERENCE_PRECISION = 120
+
 REQUIRED_AI_TEXT = (
     "exactly one AI 01 (GTIN), exactly one AI 21 (serial number), "
     "and exactly one weight AI 310n/320n"
 )
 
 
-def _exact_difference(capacity: Decimal, total: Decimal) -> Decimal:
-    """Return ``capacity - total`` without any precision rounding.
+def _difference(capacity: Decimal, total: Decimal) -> Decimal:
+    """Return ``capacity - total`` in a fixed, request-independent context.
 
-    A fixed 50-digit context is exact for item totals (six source digits
-    times the eight-digit conversion factor) but cannot hold every digit
-    of a capacity as large as ``1E+60`` minus a small load.  The operands
-    dictate the context width: one significant digit per integer digit of
-    the larger operand (``adjusted() + 1``; zero needs none) plus one per
-    fractional digit of the more precise one.  With that width the
-    subtraction -- and therefore the ``over_limit`` sign test -- keeps
-    every digit of both operands regardless of their magnitudes.
+    The precision is :data:`DIFFERENCE_PRECISION`, never derived from the
+    operands: both inputs are bounded (capacities by the envelope below,
+    totals by the 50-digit item arithmetic), so every digit the audit may
+    legitimately produce fits, while a hostile value cannot widen the
+    context into a million-digit subtraction.  The ``over_limit`` verdict
+    does not even depend on this value -- it is the exact comparison
+    ``total > capacity`` -- so a rounded remainder cannot flip it.
     """
-    if capacity.is_zero():
-        return -total
-    if total.is_zero():
-        return capacity
-    integer_digits = max(capacity.adjusted(), total.adjusted()) + 1
-    if integer_digits <= 0:
-        integer_digits = 1
-    fractional_digits = max(-capacity.as_tuple().exponent, -total.as_tuple().exponent, 0)
     with localcontext() as ctx:
-        ctx.prec = max(
-            ARITHMETIC_PRECISION, integer_digits + fractional_digits
-        )
+        ctx.prec = DIFFERENCE_PRECISION
         return capacity - total
+
+
+def _capacity_out_of_range(index: int, capacity: Decimal) -> None:
+    raise PackingStructureError(
+        {
+            "container_index": index,
+            "error": {
+                "error": "CAPACITY_OUT_OF_RANGE",
+                "message": (
+                    f"container {index}: max_weight is outside the supported "
+                    f"capacity envelope of at most "
+                    f"{MAX_CAPACITY_INTEGER_DIGITS} integer digits and "
+                    f"{-MAX_CAPACITY_EXPONENT} decimal places"
+                ),
+                "expected": (
+                    f"a finite non-negative Decimal with at most "
+                    f"{MAX_CAPACITY_INTEGER_DIGITS} integer digits and at most "
+                    f"{-MAX_CAPACITY_EXPONENT} decimal places"
+                ),
+                "found": (
+                    f"{max(capacity.adjusted(), 0) + 1} integer digits and "
+                    f"{max(-capacity.as_tuple().exponent, 0)} decimal places"
+                ),
+            },
+        }
+    )
+
+
+def _check_capacity(index: int, capacity: Decimal) -> None:
+    """Validate one ``max_weight`` against the bounded capacity envelope.
+
+    Only finite values can reach here (pydantic's ``ge=0`` already rejects
+    NaN/Infinity); the checks bound the integer magnitude via
+    :meth:`~decimal.Decimal.adjusted` (neutral against leading zeros and
+    exponent tricks such as ``1E+999999``) and the fractional depth via
+    the tuple exponent (neutral against trailing-zero coefficients).
+    """
+    if not capacity.is_finite():  # pragma: no cover - guarded by pydantic ge=0
+        _capacity_out_of_range(index, capacity)
+    integer_digits = max(capacity.adjusted(), 0) + 1
+    fractional_digits = max(-capacity.as_tuple().exponent, 0)
+    if (
+        integer_digits > MAX_CAPACITY_INTEGER_DIGITS
+        or fractional_digits > -MAX_CAPACITY_EXPONENT
+    ):
+        _capacity_out_of_range(index, capacity)
 
 
 class PackingAuditError(Exception):
@@ -331,19 +390,25 @@ def audit(
     ``{"target_unit": ..., "containers": [...]}`` with one result per
     requested container in the original order; every weight is an
     unrounded :class:`Decimal` already expressed in the target unit.
+
+    Every ``max_weight`` must fit the capacity envelope
+    (:data:`MAX_CAPACITY_INTEGER_DIGITS` / :data:`MAX_CAPACITY_EXPONENT`);
+    an out-of-envelope value raises :class:`PackingStructureError`
+    locating the container before any item is parsed.
     """
     with localcontext() as ctx:
         ctx.prec = ARITHMETIC_PRECISION
 
-        # -- unique container ids (parents refer to these) --
+        # -- unique container ids (parents refer to these) and capacity bounds --
         index_of: dict[str, int] = {}
-        for index, (container_id, _parent_id, _max_weight, _items) in enumerate(
+        for index, (container_id, _parent_id, max_weight, _items) in enumerate(
             containers
         ):
             first_index = index_of.get(container_id)
             if first_index is not None:
                 _duplicate_container(index, first_index, container_id)
             index_of[container_id] = index
+            _check_capacity(index, max_weight)
 
         # -- parse every loaded item and reject a re-loaded GTIN+serial --
         parsed: list[list[tuple[str, str, Decimal]]] = []
@@ -453,11 +518,12 @@ def audit(
             containers
         ):
             total_weight = total_weights[index]
-            # The difference is computed in an operand-sized context so a
-            # capacity such as 1E+60 keeps every digit of the loaded
-            # weight; over_limit is then the exact sign of that value
-            # rather than the sign of its six-place rendering.
-            remaining_capacity = _exact_difference(max_weight, total_weight)
+            # The over-limit verdict is the exact comparison of the
+            # unrounded operands: the six-place render below cannot flip
+            # it, and neither can the bounded subtraction context.  The
+            # remainder itself is only rendered (six places half-even).
+            over_limit = total_weight > max_weight
+            remaining_capacity = _difference(max_weight, total_weight)
             results.append(
                 {
                     "container_id": container_id,
@@ -469,7 +535,7 @@ def audit(
                     "remaining_capacity": remaining_capacity,
                     "direct_item_count": len(items),
                     "recursive_item_count": recursive_counts[index],
-                    "over_limit": remaining_capacity < 0,
+                    "over_limit": over_limit,
                 }
             )
 

@@ -364,6 +364,160 @@ def test_six_place_rendering_hides_positive_remainder_without_flagging_over():
     assert '"remaining_capacity":0.000000' in resp.text
 
 
+# ------------------------------------------------- capacity envelope / DoS guard
+
+
+def test_capacity_at_integer_envelope_boundary_returns_full_audit():
+    # 61 integer digits (1e61 - 1) is the largest accepted magnitude; the
+    # 2 kg load must still be visible in the six-place rendering.
+    cap = "9" * 61
+    resp = audit([container("EDGE", cap, [item("S1", "3103002000")])])
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["over_limit"] is False
+    assert f'"max_weight":{cap}.000000' in resp.text
+    assert f'"remaining_capacity":{"9" * 60}7.000000' in resp.text
+
+
+def test_capacity_at_fractional_envelope_boundary_returns_full_audit():
+    # 50 decimal places is the deepest accepted fractional scale; a load
+    # larger than the capacity by a sub-six-place amount must still be
+    # flagged over by the exact comparison, with a rendered -0.000000.
+    cap = "0." + "0" * 9 + "9" * 41  # 50 decimal places, ~9.9999e-10
+    resp = audit([container("EDGE", cap, [item("S1", "3109000001")])])  # 1e-9 kg
+    assert resp.status_code == 200
+    entry = resp.json()["containers"][0]
+    assert entry["over_limit"] is True
+    assert '"remaining_capacity":-0.000000' in resp.text
+
+
+def test_capacity_one_integer_digit_beyond_envelope_is_rejected():
+    cap = "1" + "0" * 61  # 1e61: 62 integer digits
+    resp = audit([container("HUGE", cap, [])])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+    assert detail["container_index"] == 0
+    assert "integer digits" in detail["error"]["message"]
+    assert detail["error"]["found"].startswith("62 integer digits")
+
+
+def test_capacity_one_decimal_place_beyond_envelope_is_rejected():
+    cap = "0." + "9" * 51
+    resp = audit([container("DEEP", cap, [])])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+    assert detail["container_index"] == 0
+    assert "decimal places" in detail["error"]["message"]
+
+
+def test_capacity_error_locates_the_offending_container_index():
+    resp = audit(
+        [
+            container("OK-1", 10, [item("S1", "3103001000")]),
+            container("OK-2", 10, []),
+            container("BAD", "1E999999", []),  # compact exponent bomb
+        ]
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["container_index"] == 2
+    assert detail["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+
+
+def test_huge_positive_exponent_bomb_is_rejected():
+    # A single compact token otherwise asks for a million-digit context.
+    resp = audit([container("BOMB", "1E999999", [])])
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+
+
+def test_huge_negative_exponent_bomb_is_rejected():
+    resp = audit([container("BOMB", "1E-999999", [])])
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+
+
+def test_dense_long_digit_string_is_rejected():
+    # A 200 000-digit dense coefficient (the memory-starvation axis) is
+    # rejected before any subtraction context is built.
+    resp = audit([container("BOMB", "9" * 200_000, [])])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+    assert detail["container_index"] == 0
+
+
+def test_leading_zero_dense_fraction_is_rejected():
+    # 0.00..001 with 100k zeros: the exponent, not the coefficient, is
+    # what makes this dangerous.
+    resp = audit([container("BOMB", "0." + "0" * 100_000 + "1", [])])
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+
+
+def test_cross_axis_capacity_stays_fast_and_is_rejected():
+    # Dense integer block *and* deep fractional tail: the original
+    # integer_digits + fractional_digits context expansion.  The request
+    # must be rejected quickly instead of allocating the digits.
+    payload = {"target_unit": "kg", "containers": []}
+    cap_text = "9" * 200_000 + "." + "9" * 200_000
+    payload["containers"].append(
+        {"container_id": "BOMB", "max_weight": cap_text, "items": []}
+    )
+    resp = client.post("/packing-audit", json=payload)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+
+
+def test_exponent_normalized_coefficient_cannot_evade_envelope():
+    # 50 coefficient digits shifted down 150 places means 150 fractional
+    # places: the adjusted exponent, not the raw text, is the boundary.
+    resp = audit([container("BOMB", "9" * 50 + "E-150", [])])
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+
+
+def test_capacity_bomb_is_rejected_without_touching_other_container_items():
+    # Validation runs before item parsing: a bad capacity cannot be hidden
+    # behind an item that would itself be expensive or invalid.
+    resp = audit(
+        [
+            container("GOOD", 10, [item("S1", "3103001000")]),
+            container("BAD", "1E700000", [item("S2", "3103001000")]),
+        ]
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["container_index"] == 1
+    assert detail["error"]["error"] == "CAPACITY_OUT_OF_RANGE"
+
+
+def test_huge_capacity_60_still_audits_load_and_nested_rollup():
+    # The documented 1e60 case must keep working end to end, including the
+    # nested roll-up and the sub-six-place over_limit semantics.
+    huge = "1" + "0" * 60
+    resp = audit(
+        [
+            container("ROOT", huge, []),
+            container(
+                "CHILD",
+                100,
+                [item("C1", "3103002000"), item("C2", "3109000001")],
+                parent_id="ROOT",
+            ),
+        ],
+        target_unit="lb",
+    )
+    assert resp.status_code == 200
+    entries = by_id(resp.json())
+    assert entries["ROOT"]["over_limit"] is False
+    assert entries["ROOT"]["recursive_item_count"] == 2
+    token = resp.text.split('"remaining_capacity":')[1].split(",")[0]
+    assert token != huge + ".000000"  # the load did not round away
+
+
 # ------------------------------------------------------------ structural errors
 
 

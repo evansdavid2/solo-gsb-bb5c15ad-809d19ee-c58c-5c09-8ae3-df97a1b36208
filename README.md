@@ -855,6 +855,11 @@ curl -X POST http://localhost:8080/batch-genealogy \
   （省略或 `null` 表示根容器；给定时必须等于本请求中某个 `container_id`）、必填的
   `max_weight`（容量上限，以 `target_unit` 计，**非负 `Decimal`**，JSON number 或字符串
   均可）和必填的 `items`（直属货品扫码数组，可为空）。
+- **`max_weight` 位数边界**：容量最多 **61 位整数位**（即小于 `1e61`，`1e60` 仍合法）
+  且最多 **50 位小数位**——这与内部 Decimal 工作精度及六位小数 JSON 输出能力一致，防止
+  超大整数量级与超深小数精度相加扩张运算上下文（单请求长期占用 CPU/内存）。越界时整单
+  返回 `422 CAPACITY_OUT_OF_RANGE`，`detail.container_index` 定位出错容器；边界内
+  （如 `1e60`）仍返回完整审计结果。
 - 每条货品扫码必须包含**恰好一个 AI 01**、**恰好一个 AI 21**（序列号）和**恰好一个
   重量 AI**（310n 或 320n，允许混合千克/磅）；AI 10（批号）与 AI 17（效期）可有可无、
   至多一个，不参与审计。任一条扫码解析失败或缺少/重复必需 AI，整个请求返回 `422`，
@@ -878,9 +883,10 @@ curl -X POST http://localhost:8080/batch-genealogy \
   `total_weight`；`recursive_item_count` 同理递归统计货品数。
 - **超重不报错**：某容器的（未舍入的精确）`total_weight` 超过 `max_weight` 时仍返回
   完整审计结果，仅将该容器标记为 `"over_limit": true`，其 `remaining_capacity`
-  （= `max_weight - total_weight`）为负值；恰好等于上限不算超重。所有重量仅在响应时
-  按**六位小数 half-even（银行家舍入）**输出为 JSON 数字（如 `2.513000`）；超重判定
-  用舍入前的精确值。
+  （= `max_weight - total_weight`，在与位数边界一致的**固定受限精度**下计算）为负值；
+  恰好等于上限不算超重。超重判定使用舍入前两操作数的**精确比较**，与六位响应值分离，
+  因此六位 half-even 舍入显示为 `0.000000` 时仍可正确判超。所有重量仅在响应时按**六位
+  小数 half-even（银行家舍入）**输出为 JSON 数字（如 `2.513000`）。
 - 响应：`target_unit` 与**按请求顺序**排列的 `containers` 数组，每项含 `container_id`、
   `parent_id`（回显）、`max_weight`、`unit`、`direct_weight`、`total_weight`、
   `remaining_capacity`、`direct_item_count`（直属货品数）、`recursive_item_count`
@@ -943,6 +949,23 @@ curl -X POST http://localhost:8080/packing-audit \
       "message": "containers 0 -> 1 -> 0 form a parent/child cycle; the container relationships must form a forest",
       "expected": "an acyclic container forest",
       "found": "cycle 0 -> 1 -> 0"
+    }
+  }
+}
+```
+
+`max_weight` 超出位数边界（多于 61 位整数位或多于 50 位小数位，含 `1E999999` 这类
+指数炸弹）时返回 `422 CAPACITY_OUT_OF_RANGE`，由 `container_index` 定位：
+
+```json
+{
+  "detail": {
+    "container_index": 0,
+    "error": {
+      "error": "CAPACITY_OUT_OF_RANGE",
+      "message": "container 0: max_weight is outside the supported capacity envelope of at most 61 integer digits and 50 decimal places",
+      "expected": "a finite non-negative Decimal with at most 61 integer digits and at most 50 decimal places",
+      "found": "1000000 integer digits and 0 decimal places"
     }
   }
 }
